@@ -68,3 +68,35 @@ export function computeMidline(kp: PoseKeypoints): PoseMidline | null {
 
   return { x: avgX, angle, confidence };
 }
+
+/**
+ * Extract keypoints from TF.js MoveNet / COCO format.
+ * COCO indices: leftShoulder=5, rightShoulder=6, leftHip=11, rightHip=12
+ * MoveNet returns pixel coordinates — we normalize to [0,1] using video dimensions.
+ */
+export function extractKeypointsCoco(
+  keypoints: Array<{ x: number; y: number; score?: number; name?: string }>,
+  videoWidth: number,
+  videoHeight: number
+): PoseKeypoints {
+  const MIN_SCORE = 0.3;
+
+  const get = (idx: number) => {
+    const kp = keypoints[idx];
+    if (!kp) return null;
+    const score = kp.score ?? 0;
+    if (score < MIN_SCORE) return null;
+    return {
+      x: videoWidth > 0 ? kp.x / videoWidth : kp.x,
+      y: videoHeight > 0 ? kp.y / videoHeight : kp.y,
+      visibility: score,
+    };
+  };
+
+  return {
+    leftShoulder: get(5),
+    rightShoulder: get(6),
+    leftHip: get(11),
+    rightHip: get(12),
+  };
+}

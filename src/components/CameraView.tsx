@@ -52,7 +52,7 @@ export function CameraView({
       canvas.height = video.videoHeight;
     }
 
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const ctx = canvas.getContext('2d');
     if (!ctx) {
       animFrameRef.current = requestAnimationFrame(renderLoop);
       return;

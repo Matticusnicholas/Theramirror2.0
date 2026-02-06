@@ -1,47 +1,49 @@
 import type { RendererOptions, PoseKeypoints } from '../types';
 
 /**
- * Core canvas renderer that performs the mirroring compositing.
+ * Canvas mirroring renderer.
  *
- * Pipeline per frame:
- * 1. Draw camera frame to canvas
- * 2. Compute pixel-space split line
- * 3. Crop source half, mirror it, composite onto opposite half
- * 4. Apply optional soft seam blending
- * 5. Draw optional overlays (skeleton, centerline)
+ * Pipeline (all GPU-accelerated drawImage, NO getImageData):
+ * 1. Draw video (flipped for selfie view) to an offscreen temp canvas
+ * 2. Draw the full temp canvas onto the visible canvas (base layer)
+ * 3. Clip to the target half, apply flip transform, draw full temp canvas again
+ *    — the clip + transform automatically selects the source half and mirrors it
+ * 4. Optional soft seam: redraw a thin strip of the original near the split
+ * 5. Draw overlays (centerline, skeleton)
  */
 
-// Reusable temp canvas — avoids allocating per frame.
-// Use a regular <canvas> for broad browser support (OffscreenCanvas unsupported on older Safari).
-let _tmpCanvas: HTMLCanvasElement | null = null;
-function getTempCanvas(w: number, h: number): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } {
-  if (!_tmpCanvas) {
-    _tmpCanvas = document.createElement('canvas');
+// Persistent offscreen buffer — avoids allocation per frame
+let _buffer: HTMLCanvasElement | null = null;
+let _bufferCtx: CanvasRenderingContext2D | null = null;
+
+function ensureBuffer(w: number, h: number) {
+  if (!_buffer) {
+    _buffer = document.createElement('canvas');
   }
-  if (_tmpCanvas.width !== w || _tmpCanvas.height !== h) {
-    _tmpCanvas.width = w;
-    _tmpCanvas.height = h;
+  if (_buffer.width !== w || _buffer.height !== h) {
+    _buffer.width = w;
+    _buffer.height = h;
   }
-  const ctx = _tmpCanvas.getContext('2d')!;
-  ctx.clearRect(0, 0, w, h);
-  return { canvas: _tmpCanvas, ctx };
+  if (!_bufferCtx) {
+    _bufferCtx = _buffer.getContext('2d')!;
+  }
+  return { canvas: _buffer, ctx: _bufferCtx };
 }
 
-// Detect ctx.filter support once (Safari < 18 doesn't support it)
-let _filterSupported: boolean | null = null;
-function supportsCtxFilter(): boolean {
-  if (_filterSupported !== null) return _filterSupported;
+// Detect ctx.filter support once (Safari < 18 doesn't have it)
+let _filterOk: boolean | null = null;
+function canUseFilter(): boolean {
+  if (_filterOk !== null) return _filterOk;
   try {
     const c = document.createElement('canvas');
-    c.width = 1;
-    c.height = 1;
-    const ctx = c.getContext('2d')!;
-    ctx.filter = 'grayscale(100%)';
-    _filterSupported = ctx.filter === 'grayscale(100%)';
+    c.width = c.height = 1;
+    const x = c.getContext('2d')!;
+    x.filter = 'grayscale(100%)';
+    _filterOk = x.filter === 'grayscale(100%)';
   } catch {
-    _filterSupported = false;
+    _filterOk = false;
   }
-  return _filterSupported;
+  return _filterOk;
 }
 
 export function renderFrame(
@@ -52,36 +54,59 @@ export function renderFrame(
   options: RendererOptions
 ) {
   const { mirrorMode, seamMode, seamWidth, splitLineX, filter } = options;
+  const buf = ensureBuffer(width, height);
 
-  ctx.save();
-
-  // Apply filters (only if the browser supports ctx.filter)
-  if (filter !== 'none' && supportsCtxFilter()) {
-    if (filter === 'grayscale') {
-      ctx.filter = 'grayscale(100%)';
-    } else if (filter === 'high-contrast') {
-      ctx.filter = 'contrast(1.5) saturate(1.2)';
-    }
+  // --- Step 1: draw selfie view into the buffer ---
+  buf.ctx.save();
+  if (filter !== 'none' && canUseFilter()) {
+    buf.ctx.filter =
+      filter === 'grayscale' ? 'grayscale(100%)' : 'contrast(1.5) saturate(1.2)';
   }
+  // Flip horizontally for selfie / mirror view
+  buf.ctx.translate(width, 0);
+  buf.ctx.scale(-1, 1);
+  buf.ctx.drawImage(video, 0, 0, width, height);
+  buf.ctx.restore();
 
-  // The video feed from getUserMedia is typically mirrored for a "selfie" view.
-  // We draw it mirrored so left/right matches the user's perspective.
-  ctx.translate(width, 0);
-  ctx.scale(-1, 1);
-  ctx.drawImage(video, 0, 0, width, height);
-  ctx.restore();
+  // --- Step 2: draw base layer to visible canvas ---
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(buf.canvas, 0, 0);
 
-  // Split line in pixel space
+  // --- Step 3: mirror one half ---
   const splitX = Math.round(splitLineX * width);
 
-  // Perform mirroring
   if (mirrorMode === 'left-to-right') {
-    mirrorHalf(ctx, width, height, splitX, 'left', seamMode, seamWidth);
+    // Clip to the RIGHT half, flip the buffer around splitX.
+    // The transform maps (x) → (2·splitX − x), so only pixels with
+    // source x ≤ splitX end up in the clip region — i.e. the LEFT half
+    // of the selfie view gets mirrored onto the RIGHT half.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(splitX, 0, width - splitX, height);
+    ctx.clip();
+    ctx.translate(2 * splitX, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(buf.canvas, 0, 0);
+    ctx.restore();
   } else {
-    mirrorHalf(ctx, width, height, splitX, 'right', seamMode, seamWidth);
+    // Clip to the LEFT half, flip around splitX.
+    // Source pixels with x ≥ splitX (right half) end up in [0, splitX].
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, splitX, height);
+    ctx.clip();
+    ctx.translate(2 * splitX, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(buf.canvas, 0, 0);
+    ctx.restore();
   }
 
-  // Draw overlays
+  // --- Step 4: soft seam (optional) ---
+  if (seamMode === 'soft' && seamWidth > 0) {
+    drawSoftSeam(ctx, buf.canvas, splitX, width, height, seamWidth);
+  }
+
+  // --- Step 5: overlays ---
   if (options.showCenterline) {
     drawCenterline(ctx, splitX, height);
   }
@@ -90,92 +115,43 @@ export function renderFrame(
   }
 }
 
-function mirrorHalf(
+/**
+ * Soft seam: blend the original frame back in near the split line
+ * using multiple thin strips at decreasing opacity.
+ * No getImageData — just globalAlpha + drawImage slices.
+ */
+function drawSoftSeam(
   ctx: CanvasRenderingContext2D,
-  canvasW: number,
-  canvasH: number,
+  original: HTMLCanvasElement,
   splitX: number,
-  sourceHalf: 'left' | 'right',
-  seamMode: 'hard' | 'soft',
+  width: number,
+  height: number,
   seamWidth: number
 ) {
-  if (sourceHalf === 'left') {
-    const srcWidth = splitX;
-    if (srcWidth <= 0) return;
-
-    // Grab the left half into a temp canvas
-    const imageData = ctx.getImageData(0, 0, srcWidth, canvasH);
-    const tmp = getTempCanvas(srcWidth, canvasH);
-    tmp.ctx.putImageData(imageData, 0, 0);
-
-    // Draw mirrored left onto right
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(splitX, 0, canvasW - splitX, canvasH);
-    ctx.clip();
-    ctx.translate(splitX * 2, 0);
-    ctx.scale(-1, 1);
-    ctx.drawImage(tmp.canvas, 0, 0);
-    ctx.restore();
-
-    if (seamMode === 'soft' && seamWidth > 0) {
-      applySoftSeam(ctx, splitX, canvasH, seamWidth, canvasW);
-    }
-  } else {
-    const srcWidth = canvasW - splitX;
-    if (srcWidth <= 0) return;
-
-    // Grab the right half into a temp canvas
-    const imageData = ctx.getImageData(splitX, 0, srcWidth, canvasH);
-    const tmp = getTempCanvas(srcWidth, canvasH);
-    tmp.ctx.putImageData(imageData, 0, 0);
-
-    // Draw mirrored right onto left
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(0, 0, splitX, canvasH);
-    ctx.clip();
-    ctx.translate(splitX, 0);
-    ctx.scale(-1, 1);
-    ctx.translate(-srcWidth, 0);
-    ctx.drawImage(tmp.canvas, 0, 0);
-    ctx.restore();
-
-    if (seamMode === 'soft' && seamWidth > 0) {
-      applySoftSeam(ctx, splitX, canvasH, seamWidth, canvasW);
-    }
-  }
-}
-
-function applySoftSeam(
-  ctx: CanvasRenderingContext2D,
-  splitX: number,
-  canvasH: number,
-  seamWidth: number,
-  canvasW: number
-) {
   const halfSeam = Math.round(seamWidth / 2);
-  const left = Math.max(0, splitX - halfSeam);
-  const right = Math.min(canvasW, splitX + halfSeam);
-  const regionWidth = right - left;
+  const steps = Math.min(halfSeam, 20); // cap iterations for perf
+  if (steps <= 0) return;
 
-  if (regionWidth <= 0) return;
+  ctx.save();
+  for (let i = 0; i < steps; i++) {
+    const t = i / steps; // 0 at center, approaches 1 at edge
+    const alpha = (1 - t) * 0.6; // strongest at center, fades out
+    const offset = Math.round(t * halfSeam);
 
-  const seamData = ctx.getImageData(left, 0, regionWidth, canvasH);
-  const data = seamData.data;
+    ctx.globalAlpha = alpha;
 
-  for (let y = 0; y < canvasH; y++) {
-    for (let x = 0; x < regionWidth; x++) {
-      const px = left + x;
-      const distFromSplit = Math.abs(px - splitX);
-      const blendFactor = distFromSplit / halfSeam;
-      const idx = (y * regionWidth + x) * 4;
-      const alpha = Math.min(1, blendFactor * blendFactor);
-      data[idx + 3] = Math.round(data[idx + 3] * (0.5 + 0.5 * alpha));
+    // Draw thin strips from the original (unmirrored) frame at the split ± offset
+    const lx = splitX - offset;
+    const rx = splitX + offset;
+    if (lx >= 0 && lx < width) {
+      ctx.drawImage(original, lx, 0, 1, height, lx, 0, 1, height);
+    }
+    if (rx >= 0 && rx < width) {
+      ctx.drawImage(original, rx, 0, 1, height, rx, 0, 1, height);
     }
   }
-
-  ctx.putImageData(seamData, left, 0);
+  ctx.globalAlpha = 1;
+  ctx.restore();
 }
 
 function drawCenterline(ctx: CanvasRenderingContext2D, splitX: number, height: number) {
@@ -198,10 +174,11 @@ function drawSkeleton(
 ) {
   ctx.save();
 
-  const drawPoint = (point: { x: number; y: number } | null, color: string) => {
-    if (!point) return;
-    const px = (1 - point.x) * width;
-    const py = point.y * height;
+  const drawPoint = (pt: { x: number; y: number } | null, color: string) => {
+    if (!pt) return;
+    // Keypoints are in normalized [0,1]; video is drawn mirrored so flip x
+    const px = (1 - pt.x) * width;
+    const py = pt.y * height;
     ctx.fillStyle = color;
     ctx.beginPath();
     ctx.arc(px, py, 6, 0, Math.PI * 2);
@@ -226,21 +203,23 @@ function drawSkeleton(
     ctx.stroke();
   };
 
+  // Torso connections
   drawLine(kp.leftShoulder, kp.rightShoulder, 'rgba(0, 255, 100, 0.7)');
   drawLine(kp.leftHip, kp.rightHip, 'rgba(0, 255, 100, 0.7)');
   drawLine(kp.leftShoulder, kp.leftHip, 'rgba(0, 255, 100, 0.5)');
   drawLine(kp.rightShoulder, kp.rightHip, 'rgba(0, 255, 100, 0.5)');
 
+  // Midline
   if (kp.leftShoulder && kp.rightShoulder && kp.leftHip && kp.rightHip) {
-    const shoulderMid = {
+    const sMid = {
       x: (kp.leftShoulder.x + kp.rightShoulder.x) / 2,
       y: (kp.leftShoulder.y + kp.rightShoulder.y) / 2,
     };
-    const hipMid = {
+    const hMid = {
       x: (kp.leftHip.x + kp.rightHip.x) / 2,
       y: (kp.leftHip.y + kp.rightHip.y) / 2,
     };
-    drawLine(shoulderMid, hipMid, 'rgba(255, 200, 0, 0.8)');
+    drawLine(sMid, hMid, 'rgba(255, 200, 0, 0.8)');
   }
 
   drawPoint(kp.leftShoulder, '#00ff66');

@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PoseKeypoints, PoseMidline } from '../types';
-import { extractKeypoints, computeMidline } from '../lib/poseUtils';
+import { extractKeypoints, computeMidline, extractKeypointsCoco } from '../lib/poseUtils';
 import { EMAFilter } from '../lib/smoothing';
 
-// Lazy-loaded MediaPipe types
-type PoseLandmarkerType = import('@mediapipe/tasks-vision').PoseLandmarker;
+/**
+ * Unified pose interface — wraps either MediaPipe or MoveNet.
+ */
+interface PoseBackend {
+  detect(video: HTMLVideoElement, timestamp: number): PoseKeypoints | null;
+  name: string;
+}
 
 interface UsePoseOptions {
   enabled: boolean;
@@ -13,13 +18,14 @@ interface UsePoseOptions {
 }
 
 export function usePose({ enabled, smoothingAlpha, inferenceInterval }: UsePoseOptions) {
-  const landmarkerRef = useRef<PoseLandmarkerType | null>(null);
+  const backendRef = useRef<PoseBackend | null>(null);
   const smootherRef = useRef(new EMAFilter(smoothingAlpha));
   const frameCountRef = useRef(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [midline, setMidline] = useState<PoseMidline | null>(null);
   const [keypoints, setKeypoints] = useState<PoseKeypoints | null>(null);
+  const [backendName, setBackendName] = useState<string>('');
   const initPromiseRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
@@ -27,60 +33,41 @@ export function usePose({ enabled, smoothingAlpha, inferenceInterval }: UsePoseO
   }, [smoothingAlpha]);
 
   const initialize = useCallback(async () => {
-    if (landmarkerRef.current) return;
+    if (backendRef.current) return;
     if (initPromiseRef.current) return initPromiseRef.current;
 
     const initPromise = (async () => {
       setLoading(true);
       setError(null);
+
+      // --- Try MediaPipe first (best quality, 33 landmarks) ---
       try {
-        // Dynamic import — if @mediapipe/tasks-vision fails to load (WASM not
-        // supported, network error, etc.) it won't crash the rest of the app.
-        const { PoseLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
-
-        const vision = await FilesetResolver.forVisionTasks(
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
-        );
-
-        let delegate: 'GPU' | 'CPU' = 'GPU';
-        try {
-          const landmarker = await PoseLandmarker.createFromOptions(vision, {
-            baseOptions: {
-              modelAssetPath:
-                'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-              delegate,
-            },
-            runningMode: 'VIDEO',
-            numPoses: 1,
-            minPoseDetectionConfidence: 0.5,
-            minTrackingConfidence: 0.5,
-          });
-          landmarkerRef.current = landmarker;
-        } catch {
-          // GPU delegate can fail on some mobile devices — fall back to CPU
-          delegate = 'CPU';
-          const landmarker = await PoseLandmarker.createFromOptions(vision, {
-            baseOptions: {
-              modelAssetPath:
-                'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-              delegate,
-            },
-            runningMode: 'VIDEO',
-            numPoses: 1,
-            minPoseDetectionConfidence: 0.5,
-            minTrackingConfidence: 0.5,
-          });
-          landmarkerRef.current = landmarker;
-        }
-      } catch (err) {
-        console.error('Failed to load pose model:', err);
-        setError(
-          'Failed to load pose detection. The mirror will still work — ' +
-          'the centerline just won\'t track your body automatically.'
-        );
-      } finally {
+        const backend = await initMediaPipe();
+        backendRef.current = backend;
+        setBackendName(backend.name);
         setLoading(false);
+        return;
+      } catch (e) {
+        console.warn('MediaPipe init failed, trying MoveNet fallback:', e);
       }
+
+      // --- Fall back to TF.js MoveNet (wider browser compat) ---
+      try {
+        const backend = await initMoveNet();
+        backendRef.current = backend;
+        setBackendName(backend.name);
+        setLoading(false);
+        return;
+      } catch (e) {
+        console.warn('MoveNet init also failed:', e);
+      }
+
+      // Both failed
+      setError(
+        'Pose detection unavailable on this browser. ' +
+        'The mirror still works — use the Calibration panel to set the centerline manually.'
+      );
+      setLoading(false);
     })();
 
     initPromiseRef.current = initPromise;
@@ -89,17 +76,15 @@ export function usePose({ enabled, smoothingAlpha, inferenceInterval }: UsePoseO
 
   const detectPose = useCallback(
     (video: HTMLVideoElement, timestamp: number) => {
-      if (!enabled || !landmarkerRef.current) return;
+      if (!enabled || !backendRef.current) return;
 
       frameCountRef.current++;
       if (frameCountRef.current % inferenceInterval !== 0) return;
 
       try {
-        const result = landmarkerRef.current.detectForVideo(video, timestamp);
-        if (result.landmarks && result.landmarks.length > 0) {
-          const kp = extractKeypoints(result.landmarks[0]);
+        const kp = backendRef.current.detect(video, timestamp);
+        if (kp) {
           setKeypoints(kp);
-
           const raw = computeMidline(kp);
           if (raw) {
             const smoothedX = smootherRef.current.update(raw.x);
@@ -107,7 +92,7 @@ export function usePose({ enabled, smoothingAlpha, inferenceInterval }: UsePoseO
           }
         }
       } catch {
-        // Pose inference can occasionally fail on a frame; skip silently
+        // Skip failed frames silently
       }
     },
     [enabled, inferenceInterval]
@@ -121,8 +106,7 @@ export function usePose({ enabled, smoothingAlpha, inferenceInterval }: UsePoseO
 
   useEffect(() => {
     return () => {
-      landmarkerRef.current?.close();
-      landmarkerRef.current = null;
+      backendRef.current = null;
     };
   }, []);
 
@@ -134,5 +118,95 @@ export function usePose({ enabled, smoothingAlpha, inferenceInterval }: UsePoseO
     keypoints,
     loading,
     error,
+    backendName,
+  };
+}
+
+// ─── MediaPipe backend ──────────────────────────────────────────────────
+
+async function initMediaPipe(): Promise<PoseBackend> {
+  const { PoseLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
+
+  const vision = await FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+  );
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let landmarker: any;
+
+  try {
+    landmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      numPoses: 1,
+    });
+  } catch {
+    landmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+        delegate: 'CPU',
+      },
+      runningMode: 'VIDEO',
+      numPoses: 1,
+    });
+  }
+
+  return {
+    name: 'MediaPipe',
+    detect(video, timestamp) {
+      const result = landmarker.detectForVideo(video, timestamp);
+      if (result.landmarks && result.landmarks.length > 0) {
+        return extractKeypoints(result.landmarks[0]);
+      }
+      return null;
+    },
+  };
+}
+
+// ─── TF.js MoveNet backend (fallback for iOS Safari, etc.) ──────────────
+
+async function initMoveNet(): Promise<PoseBackend> {
+  const tf = await import('@tensorflow/tfjs');
+  await tf.ready();
+
+  const poseDetection = await import('@tensorflow-models/pose-detection');
+  const detector = await poseDetection.createDetector(
+    poseDetection.SupportedModels.MoveNet,
+    {
+      modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+    }
+  );
+
+  // MoveNet's estimatePoses() is async, but our detect() is called
+  // synchronously from the rAF loop. Solution: fire-and-forget the
+  // async detection and return the most recent cached result.
+  let lastResult: PoseKeypoints | null = null;
+  let detecting = false;
+
+  return {
+    name: 'MoveNet',
+    detect(video) {
+      if (!detecting) {
+        detecting = true;
+        detector.estimatePoses(video).then(poses => {
+          if (poses.length > 0) {
+            lastResult = extractKeypointsCoco(
+              poses[0].keypoints,
+              video.videoWidth || video.width,
+              video.videoHeight || video.height
+            );
+          }
+          detecting = false;
+        }).catch(() => {
+          detecting = false;
+        });
+      }
+      return lastResult;
+    },
   };
 }
