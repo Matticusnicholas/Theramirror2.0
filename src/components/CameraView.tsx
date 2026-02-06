@@ -58,21 +58,26 @@ export function CameraView({
       return;
     }
 
-    // Pose detection callback
-    if (onFrame) {
-      onFrame(video, performance.now());
-    }
+    try {
+      // Pose detection callback
+      if (onFrame) {
+        onFrame(video, performance.now());
+      }
 
-    renderFrame(ctx, video, canvas.width, canvas.height, {
-      mirrorMode,
-      seamMode,
-      seamWidth,
-      splitLineX: splitLineNormalized,
-      showSkeleton,
-      showCenterline,
-      filter,
-      keypoints,
-    });
+      renderFrame(ctx, video, canvas.width, canvas.height, {
+        mirrorMode,
+        seamMode,
+        seamWidth,
+        splitLineX: splitLineNormalized,
+        showSkeleton,
+        showCenterline,
+        filter,
+        keypoints,
+      });
+    } catch (err) {
+      // Log but don't kill the loop — next frame may succeed
+      console.warn('Render frame error:', err);
+    }
 
     animFrameRef.current = requestAnimationFrame(renderLoop);
   }, [

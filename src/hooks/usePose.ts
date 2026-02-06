@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { PoseLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 import type { PoseKeypoints, PoseMidline } from '../types';
 import { extractKeypoints, computeMidline } from '../lib/poseUtils';
 import { EMAFilter } from '../lib/smoothing';
 
+// Lazy-loaded MediaPipe types
+type PoseLandmarkerType = import('@mediapipe/tasks-vision').PoseLandmarker;
+
 interface UsePoseOptions {
   enabled: boolean;
   smoothingAlpha: number;
-  inferenceInterval: number; // Run pose every N frames
+  inferenceInterval: number;
 }
 
 export function usePose({ enabled, smoothingAlpha, inferenceInterval }: UsePoseOptions) {
-  const landmarkerRef = useRef<PoseLandmarker | null>(null);
+  const landmarkerRef = useRef<PoseLandmarkerType | null>(null);
   const smootherRef = useRef(new EMAFilter(smoothingAlpha));
   const frameCountRef = useRef(0);
   const [loading, setLoading] = useState(false);
@@ -20,7 +22,6 @@ export function usePose({ enabled, smoothingAlpha, inferenceInterval }: UsePoseO
   const [keypoints, setKeypoints] = useState<PoseKeypoints | null>(null);
   const initPromiseRef = useRef<Promise<void> | null>(null);
 
-  // Update smoother alpha when it changes
   useEffect(() => {
     smootherRef.current.setAlpha(smoothingAlpha);
   }, [smoothingAlpha]);
@@ -33,24 +34,50 @@ export function usePose({ enabled, smoothingAlpha, inferenceInterval }: UsePoseO
       setLoading(true);
       setError(null);
       try {
+        // Dynamic import — if @mediapipe/tasks-vision fails to load (WASM not
+        // supported, network error, etc.) it won't crash the rest of the app.
+        const { PoseLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
+
         const vision = await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
         );
-        const landmarker = await PoseLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath:
-              'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-            delegate: 'GPU',
-          },
-          runningMode: 'VIDEO',
-          numPoses: 1,
-          minPoseDetectionConfidence: 0.5,
-          minTrackingConfidence: 0.5,
-        });
-        landmarkerRef.current = landmarker;
+
+        let delegate: 'GPU' | 'CPU' = 'GPU';
+        try {
+          const landmarker = await PoseLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath:
+                'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+              delegate,
+            },
+            runningMode: 'VIDEO',
+            numPoses: 1,
+            minPoseDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+          });
+          landmarkerRef.current = landmarker;
+        } catch {
+          // GPU delegate can fail on some mobile devices — fall back to CPU
+          delegate = 'CPU';
+          const landmarker = await PoseLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath:
+                'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+              delegate,
+            },
+            runningMode: 'VIDEO',
+            numPoses: 1,
+            minPoseDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+          });
+          landmarkerRef.current = landmarker;
+        }
       } catch (err) {
         console.error('Failed to load pose model:', err);
-        setError('Failed to load pose detection model. Check your connection.');
+        setError(
+          'Failed to load pose detection. The mirror will still work — ' +
+          'the centerline just won\'t track your body automatically.'
+        );
       } finally {
         setLoading(false);
       }
@@ -92,7 +119,6 @@ export function usePose({ enabled, smoothingAlpha, inferenceInterval }: UsePoseO
     setKeypoints(null);
   }, []);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       landmarkerRef.current?.close();
