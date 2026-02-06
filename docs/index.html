@@ -6,10 +6,37 @@
     <meta name="description" content="TheraMirror — Browser-based mirror therapy tool for phantom limb pain. All processing happens locally." />
     <meta name="theme-color" content="#111111" />
     <title>TheraMirror</title>
-    <script type="module" crossorigin src="./assets/index-d2jCCMyp.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-BnYYIQgi.css">
+    <style>
+      /* Critical inline CSS so page is never blank white */
+      html, body { margin: 0; padding: 0; background: #111; color: #e8e8e8; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+      #root:empty::after { content: 'Loading TheraMirror...'; display: flex; justify-content: center; align-items: center; height: 100vh; font-size: 1.25rem; color: #00d4ff; }
+    </style>
+    <script>
+      // Production redirect: when GitHub Pages serves the RAW source index.html
+      // (not the built one), redirect to the docs/ subfolder.
+      // In the built output, Vite replaces the /src/main.tsx script tag, so
+      // this check only matches on the unbuilt source page.
+      (function() {
+        var isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+        var isSourcePage = !!document.querySelector('script[src$="/src/main.tsx"]');
+        if (!isLocal && isSourcePage) {
+          var base = location.pathname.replace(/\/$/, '');
+          location.replace(base + '/docs/');
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="./assets/index-okWOK3t0.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-CN5ubsDm.css">
   </head>
   <body>
     <div id="root"></div>
+    <noscript>
+      <div style="display:flex;justify-content:center;align-items:center;height:100vh;padding:2rem;text-align:center;color:#aaa;">
+        <div>
+          <h1 style="color:#00d4ff;">TheraMirror</h1>
+          <p>JavaScript is required to run this app.</p>
+        </div>
+      </div>
+    </noscript>
   </body>
 </html>
